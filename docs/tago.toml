@@ -1,0 +1,10 @@
+title       = "openbd"
+baseURL     = "https://openbd-cli.tamnd.com/"
+description = "A command line for openbd."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/openbd-cli"
