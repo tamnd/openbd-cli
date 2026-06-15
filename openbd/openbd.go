@@ -1,62 +1,163 @@
 // Package openbd is the library behind the openbd command line:
-// the HTTP client, request shaping, and the typed data models for openbd.
+// the HTTP client, request shaping, and typed data models for the OpenBD API
+// (https://api.openbd.jp), the Japanese book database with 1.9M ISBNs.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// No API key is required. The Client paces requests, sets a real User-Agent,
+// and retries transient failures (429 and 5xx).
 package openbd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to openbd. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "openbd/dev (+https://github.com/tamnd/openbd-cli)"
+// Host is the site this client talks to.
+const Host = "api.openbd.jp"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at openbd.com; change it once you
-// know the real endpoints you want to read.
-const Host = "openbd.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to openbd over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunable parameters for the Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://api.openbd.jp",
+		UserAgent: "openbd-cli/0.1 (+https://github.com/tamnd/openbd-cli)",
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   15 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the OpenBD API.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client with the given configuration.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Book holds the public data about a single book.
+type Book struct {
+	ISBN      string `kit:"id" json:"isbn"`
+	Title     string `json:"title"`
+	Author    string `json:"author"`
+	Publisher string `json:"publisher"`
+	PubDate   string `json:"pubdate"`
+	Series    string `json:"series,omitempty"`
+	Volume    string `json:"volume,omitempty"`
+	Cover     string `json:"cover,omitempty"`
+}
+
+// Coverage holds the count of ISBNs covered by OpenBD.
+type Coverage struct {
+	Count int `json:"count"`
+}
+
+// --- wire types ---
+
+type wireTextContent struct {
+	TextType struct {
+		Content string `json:"content"`
+	} `json:"TextType"`
+	Text string `json:"Text"`
+}
+
+type wireTitleElement struct {
+	TitleText struct {
+		Content string `json:"content"`
+	} `json:"TitleText"`
+}
+
+type wireBook struct {
+	Summary struct {
+		ISBN      string `json:"isbn"`
+		Title     string `json:"title"`
+		Volume    string `json:"volume"`
+		Series    string `json:"series"`
+		Publisher string `json:"publisher"`
+		PubDate   string `json:"pubdate"`
+		Cover     string `json:"cover"`
+		Author    string `json:"author"`
+	} `json:"summary"`
+	Onix struct {
+		DescriptiveDetail struct {
+			TitleDetail struct {
+				TitleElement []wireTitleElement `json:"TitleElement"`
+			} `json:"TitleDetail"`
+		} `json:"DescriptiveDetail"`
+		CollateralDetail struct {
+			TextContent []wireTextContent `json:"TextContent"`
+		} `json:"CollateralDetail"`
+	} `json:"onix"`
+}
+
+// GetBooks fetches books by one or more ISBNs (comma-separated).
+// The API returns null for ISBNs not found; those are skipped.
+func (c *Client) GetBooks(ctx context.Context, isbns string) ([]Book, error) {
+	rawURL := c.cfg.BaseURL + "/v1/get?isbn=" + isbns
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// The API returns a JSON array of objects or nulls.
+	var raw []json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("parse books: %w", err)
+	}
+
+	var out []Book
+	for _, r := range raw {
+		if string(r) == "null" {
+			continue
+		}
+		var w wireBook
+		if err := json.Unmarshal(r, &w); err != nil {
+			continue
+		}
+		out = append(out, flattenBook(w))
+	}
+	return out, nil
+}
+
+// GetCoverage returns the count of ISBNs covered by OpenBD.
+func (c *Client) GetCoverage(ctx context.Context) (*Coverage, error) {
+	rawURL := c.cfg.BaseURL + "/v1/coverage"
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var isbns []string
+	if err := json.Unmarshal(body, &isbns); err != nil {
+		return nil, fmt.Errorf("parse coverage: %w", err)
+	}
+	return &Coverage{Count: len(isbns)}, nil
+}
+
+// get fetches a URL and returns the body, pacing and retrying as configured.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +165,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +174,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -104,12 +206,13 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +226,24 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on openbd.com. It is a stand-in for the typed records you
-// will model from the real openbd endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `openbd cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
+// --- flatten helpers ---
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
+func flattenBook(w wireBook) Book {
+	title := w.Summary.Title
+	// Use the long title from ONIX if available.
+	if elems := w.Onix.DescriptiveDetail.TitleDetail.TitleElement; len(elems) > 0 {
+		if t := strings.TrimSpace(elems[0].TitleText.Content); t != "" {
+			title = t
 		}
 	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+	return Book{
+		ISBN:      w.Summary.ISBN,
+		Title:     title,
+		Author:    w.Summary.Author,
+		Publisher: w.Summary.Publisher,
+		PubDate:   w.Summary.PubDate,
+		Series:    w.Summary.Series,
+		Volume:    w.Summary.Volume,
+		Cover:     w.Summary.Cover,
 	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
